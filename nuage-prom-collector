@@ -1,0 +1,641 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+'''
+Copyright 2017 Paul Greenberg
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+IN THE SOFTWARE.
+'''
+
+from __future__ import (absolute_import, division, print_function);
+__metaclass__ = type
+
+import os;
+import sys;
+import stat;
+import time;
+import ConfigParser;
+import re;
+import pprint;
+import traceback;
+import argparse;
+import logging;
+import copy;
+from ipaddress import IPv4Interface, IPv4Address, IPv4Network;
+
+from functools import reduce;
+import operator;
+
+from vspk import v5_0 as vspk;
+
+product = 'Prometheus Exporter for Nuage VSP';
+toolname = str(os.path.basename(__file__)).replace('.pyc', '').replace('.py', '').replace('./', '');
+tooldir = str(__file__).replace(os.path.basename(__file__), '');
+
+logger = logging.getLogger(toolname);
+logging.basicConfig(stream=sys.stdout, format='%(levelname)s | %(message)s');
+
+import urllib3;
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning);
+
+from bambou.exceptions import BambouHTTPError;
+
+class GetDirPath(argparse.Action):
+    ''' Expands user-supplied path '''
+    def __call__(self, parser, namespace, values, option_string=None):
+        dp = values;
+        if not re.match('^[/.]', dp):
+            dp = os.path.join(os.getcwd(), dp);
+        if not self._is_dir_path(dp):
+            parser.error(str(dp) + " is not a directory");
+        setattr(namespace, 'output', os.path.abspath(os.path.expanduser(dp)));
+
+    @staticmethod
+    def _is_dir_path(dp):
+        if os.path.isdir(dp):
+            return True;
+        return False;
+
+def _get_var_type(t):
+    if t == 'str':
+        return (str, unicode);
+    elif t == 'bool':
+        return bool;
+    elif t == 'int':
+        return int;
+    elif t == 'float':
+        return float;
+    else:
+        logger.erro("Received unsupported variable type: %s" % (t));
+    return None;
+
+def _load_cfg():
+    r = {};
+    fn = os.path.expanduser("~/.nuage_api.cfg");
+    logger.info("Nuage API configuration file: %s" % (fn));
+    if not os.path.exists(fn):
+        logger.error("Configuration file '%s' does not exist" % (fn));
+        sys.exit(1);
+    fs = os.stat(fn);
+    if fs.st_mode & stat.S_IROTH:
+        logger.error("Configuration file '%s' is world readable. Secure it with 'chmod 600 %s'" % (fn, fn));
+        sys.exit(1);
+    if fs.st_mode & stat.S_IRGRP:
+        logger.error("Configuration file '%s' is group readable. Secure it with 'chmod 600 %s'" % (fn, fn));
+        sys.exit(1);
+    cfg_parser = ConfigParser.RawConfigParser();
+    try:
+        cfg_parser.read(fn);
+        r['password'] = cfg_parser.get('default', 'password');
+        r['password'] = r['password'].strip('"').strip("'");
+        logger.info("Nuage VSD password found");
+    except:
+        exc_type, exc_value, exc_traceback = sys.exc_info();
+        logger.error("%s: %s" % (exc_type, exc_value));
+        sys.exit(1);
+    return r;
+
+def main():
+    global logger;
+
+    descr = toolname + ' - ' + product + '\n\n';
+    epil = '\ncontacts: Paul Greenberg (@greenpau)\n\n';
+    epil += 'examples:\n\n';
+    epil += '    $ %s --output /var/lib/prometheus\n' % (toolname);
+    epil += '    $ %s --output /var/lib/prometheus --file localhost\n' % (toolname);
+    epil += '\n\n ';
+    parser = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter, \
+                                     description=descr, epilog=epil);
+    main_group = parser.add_argument_group(product + ' arguments')
+    main_group.add_argument('--host', dest='host', metavar='IP_OR_NAME', \
+                            type=str, default='localhost', help='Nuage VSD API Host');
+    main_group.add_argument('--port', dest='port', metavar='NUMBER', \
+                            type=int, default=8443, help='Nuage VSD API Port');
+    main_group.add_argument('--enterprise', dest='enterprise', metavar='NAME', \
+                            type=str, default='csp', help='Nuage VSD Enterprise');
+    main_group.add_argument('--user', dest='user', metavar='NAME', \
+                            type=str, default='csproot', help='Nuage VSD API User');
+
+    out_group = parser.add_argument_group('Output');
+    out_group.add_argument('--file', metavar='NAME', dest='filename', default='localhost', \
+                            help='file name, suffix .prom is added automatically');
+    out_group.add_argument('--output', metavar='PATH', action=GetDirPath, default='/var/lib/prometheus', \
+                            help='output directory');
+    out_group.add_argument('--add-timestamp', dest='add_timestamp', action='store_true',
+                            help='enables adding timestamps to metrics');
+
+    logging_group = parser.add_argument_group('Logging and Debugging');
+    logging_group.add_argument('-l', '--log-level', dest='ilog', metavar='LEVEL', type=int, default=0, \
+                            choices=range(1, 3), help='Log level (default: 0, max: 2)');
+    logging_group.add_argument('--sanity-check', dest='sanity_check', action='store_true',
+                            help='check field types against received values');
+
+    args = parser.parse_args();
+    external_loggers = [
+        'vspk',
+    ];
+    if args.ilog == 1:
+        logger.setLevel(logging.INFO);
+        for external_logger in external_loggers:
+            logging.getLogger(external_logger).setLevel(logging.INFO);
+    elif args.ilog == 2:
+        logger.setLevel(logging.DEBUG);
+        for external_logger in external_loggers:
+            logging.getLogger(external_logger).setLevel(logging.DEBUG);
+    else:
+        logger.setLevel(logging.WARNING);
+        for external_logger in external_loggers:
+            logging.getLogger(external_logger).setLevel(logging.WARNING);
+
+    if not re.search('\.prom$', args.filename):
+        args.output = os.path.join(args.output, args.filename + '.prom');
+    else:
+        args.output = os.path.join(args.output, args.filename);
+
+    logger.info("Log level: %d" % (args.ilog));
+    logger.info("Output file: %s" % (args.output));
+    logger.info("Nuage Enterprise: %s" % (args.enterprise));
+    logger.info("Nuage API Username: %s" % (args.user));
+
+    vsd_url = "https://%s:%d" % (args.host, args.port);
+    logger.info("Nuage VSD URL: %s" % (vsd_url));
+    vsd_api = _load_cfg();
+
+    vsd_session = vspk.NUVSDSession(username=args.user, password=vsd_api['password'], enterprise=args.enterprise, api_url=vsd_url);
+    metrics = {
+        'nuage_vsp_metric_changed': {'help': 'Any change to this metric means that there is a change to a different metric', 'type': 'gauge', 'entries': []},
+        'nuage_vsp_container_vport_active': {'skip': 'yes'},
+        'nuage_vsp_host_current_cpu_usage': {'help': 'Current CPU usage of SDN-enabled host', 'type': 'gauge'},
+        'nuage_vsp_host_average_cpu_usage': {'help': 'Average CPU usage of SDN-enabled host', 'type': 'gauge'},
+        'nuage_vsp_host_peak_cpu_usage': {'help': 'Peak CPU usage of SDN-enabled host', 'type': 'gauge'},
+        'nuage_vsp_host_current_memory_usage': {'help': 'Current memory usage of SDN-enabled host', 'type': 'gauge'},
+        'nuage_vsp_host_average_memory_usage': {'help': 'Average memory usage of SDN-enabled host', 'type': 'gauge'},
+        'nuage_vsp_host_peak_memory_usage': {'help': 'Peak memory usage of SDN-enabled host', 'type': 'gauge'},
+        'nuage_vsp_host_number_of_bridge_interfaces': {'help': 'Number of bridge interface of SDN-enabled host', 'type': 'gauge'},
+        'nuage_vsp_host_number_of_containers': {'help': 'Number of containers of SDN-enabled host', 'type': 'gauge'},
+        'nuage_vsp_host_number_of_host_interfaces': {'help': 'Number of host interface of SDN-enabled host', 'type': 'gauge'},
+        'nuage_vsp_host_number_of_virtual_machines': {'help': 'Number of virtual machines (VM) of SDN-enabled host', 'type': 'gauge'},
+        'nuage_vsp_host_primary_vsc_connection_lost': {'help': 'Indicates whether SDN-enabled host lost connectivity to its primary controller', 'type': 'gauge'},
+        'nuage_vsp_host_revert_behavior_enabled': {'help': 'Flag to indicate if the SDN controller revert behavior on SDN-enabled host took place or not', 'type': 'gauge'},
+        'nuage_vsp_host_revert_completed': {'help': 'Flag to indicate whether the SDN controller revert behavior on SDN-enabled host was successful', 'type': 'gauge'},
+        'nuage_vsp_host_revert_count': {'help': 'Indicates the number of retries that took place for the SDN controller revert behavior on SDN-enabled host', 'type': 'gauge'},
+        'nuage_vsp_host_revert_failed_count': {'help': 'Indicates the number of failed attempts for the SDN controller revert behavior on SDN-enabled host', 'type': 'gauge'},
+        'nuage_vsp_host_uptime_epoch': {'skip': 'yes'},
+        'nuage_vsp_host_uptime': {'help': 'Indicates how long SDN function was enabled on a host', 'type': 'counter'},
+        'nuage_vsp_host_cluster_node_role': {'help': 'Node Role', 'type': 'gauge'},
+        'nuage_vsp_host_jsonrpc_connection_state': {'help': 'JSON-RPC Connection State', 'type': 'gauge'},
+        'nuage_vsp_host_hypervisor_connection_state': {'help': 'Hypervisor Connection State', 'type': 'gauge'},
+        'nuage_vsp_host_standby_controller': {'help': 'Standby Controller', 'type': 'gauge'},
+        'nuage_vsp_host_active_controller_set': {'help': 'Active Controller set (1) or else (0)', 'type': 'gauge'},
+        'nuage_vsp_host_standby_controller_set': {'help': 'Standby Controller set (1) or else (0)', 'type': 'gauge'},
+        'nuage_vsp_host_is_resilient': {'help': 'Resilient', 'type': 'gauge'},
+        'nuage_vsp_controller_current_cpu_usage': {'help': 'Current CPU usage of SDN-enabled controller', 'type': 'gauge'},
+        'nuage_vsp_controller_average_cpu_usage': {'help': 'Average CPU usage of SDN-enabled controller', 'type': 'gauge'},
+        'nuage_vsp_controller_peak_cpu_usage': {'help': 'Peak CPU usage of SDN-enabled controller', 'type': 'gauge'},
+        'nuage_vsp_controller_current_memory_usage': {'help': 'Current memory usage of SDN-enabled controller', 'type': 'gauge'},
+        'nuage_vsp_controller_average_memory_usage': {'help': 'Average memory usage of SDN-enabled controller', 'type': 'gauge'},
+        'nuage_vsp_controller_peak_memory_usage': {'help': 'Peak memory usage of SDN-enabled controller', 'type': 'gauge'},
+        'nuage_vsp_controller_unavailable_timestamp': {'help': 'The duration SDN controller is unavailable (in millis).', 'type': 'counter'},
+        'nuage_vsp_controller_number_of_hosts': {'help': 'Number of SDN-enabled host connected to the controller', 'type': 'gauge'},
+        'nuage_vsp_subnet_number_of_containers': {'help': 'Number of containers on SDN-enabled subnet', 'type': 'gauge'},
+        #'': {'help': 'TBD', 'type': ''},
+    };
+
+    vrs_ids = [];
+    try:
+        vsd_session.start();
+        logger.info("Nuage VSD API session started");
+        db = {'counters': {}};
+        fields = {
+            'subnets' : {
+                '_id': 'str',
+            },
+            'controllers': {
+                '_id': 'str',
+                'name': 'str',
+                'description': 'str',
+                'management_ip': 'str',
+                'address': 'str',
+                'unavailable_timestamp': 'int',
+                'location': 'str',
+                'product_version': 'str',
+                'status': 'str',
+                'current_cpuusage': 'float',
+                'current_memory_usage': 'float',
+                'average_cpuusage': 'float',
+                'average_memory_usage': 'float',
+                'peak_cpuusage': 'float',
+                'peak_memory_usage': 'float',
+            },
+            'hosts': {
+                '_id': 'str',
+                'name': 'str',
+                'status': 'str',
+                'product_version': 'str',
+                'location': 'str',
+                'licensed_state': 'str',
+                'description': 'str',
+                'personality': 'str',
+                'address': 'str',
+                'management_ip': 'str',
+                'number_of_bridge_interfaces': 'int',
+                'number_of_containers': 'int',
+                'number_of_host_interfaces': 'int',
+                'number_of_virtual_machines': 'int',
+                'current_cpuusage': 'float',
+                'current_memory_usage': 'float',
+                'average_cpuusage': 'float',
+                'average_memory_usage': 'float',
+                'peak_cpuusage': 'float',
+                'peak_memory_usage': 'float',
+                'hypervisor_connection_state': 'str',
+                'hypervisor_name': 'str',
+                'hypervisor_type': 'str',
+                'hypervisor_identifier': 'str',
+                'cluster_node_role': 'str',
+                'jsonrpc_connection_state': 'str',
+                'peer': 'str',
+                'revert_behavior_enabled': 'bool',
+                'revert_completed': 'bool',
+                'revert_count': 'int',
+                'revert_failed_count': 'int',
+                'role': 'str',
+                'is_resilient': 'str',
+                'primary_vsc_connection_lost': 'bool',
+                'uptime': 'int',
+                'uptime_date': 'str',
+                'uptime_epoch': 'int',
+                'active_controller': 'str',
+                'standby_controller': 'str',
+                'config_active_controller': 'str',
+                'config_standby_controller': 'str',
+            },
+            'vports': {
+                'name': 'str',
+                'type': 'str',
+                'description': 'str',
+                'active': 'str',
+                'operational_state': 'str',
+                'system_type': 'str',
+            },
+            'containers': {
+                'name': 'str',
+                'uuid': 'str',
+                'status': 'str',
+                'hypervisor_ip': 'str',
+                'vrsid': 'str',
+                'image_name': 'str',
+                'image_id': 'str',
+            },
+            'container_interfaces': {
+                'name': 'str',
+                'ip_address': 'str',
+                'netmask': 'str',
+                'mac': 'str',
+                'gateway': 'str',
+            }
+        };
+
+        timestamp = int(round(time.time()));
+        try:
+            vsd_session.user.enterprises.fetch();
+            vsd_session.user.vsps.fetch();
+        except:
+            exc_type, exc_value, exc_traceback = sys.exc_info();
+            logger.error("%s: %s" % (exc_type, exc_value));
+            sys.exit(1)
+        for nu_enterprise in sorted(vsd_session.user.enterprises):
+            if re.search('Shared', nu_enterprise.name):
+                continue;
+            if not hasattr(nu_enterprise, 'domains'):
+                continue;
+            _nu_enterprise = "%s" % (nu_enterprise.name);
+            try:
+                nu_enterprise.domains.fetch();
+            except:
+                exc_type, exc_value, exc_traceback = sys.exc_info();
+                logger.warn("%s: %s" % (exc_type, exc_value));
+                continue;
+            for nu_domain in sorted(nu_enterprise.domains):
+                if not hasattr(nu_domain, 'zones'):
+                    continue;
+                _nu_domain = "%s" % (nu_domain.name);
+                try:
+                    nu_domain.zones.fetch();
+                except:
+                    exc_type, exc_value, exc_traceback = sys.exc_info();
+                    logger.warn("%s: %s" % (exc_type, exc_value));
+                    continue;
+                for nu_zone in sorted(nu_domain.zones):
+                    if not hasattr(nu_zone, 'subnets'):
+                        continue;
+                    _nu_zone = "%s" % (nu_zone.name);
+                    try:
+                        nu_zone.subnets.fetch();
+                    except:
+                        exc_type, exc_value, exc_traceback = sys.exc_info();
+                        logger.warn("%s: %s" % (exc_type, exc_value));
+                        continue;
+                    for nu_subnet in sorted(nu_zone.subnets):
+                        _nu_subnet = "%s" % (nu_subnet.name);
+                        if not hasattr(nu_subnet, 'vports') or not hasattr(nu_subnet, 'address') or not hasattr(nu_subnet, 'netmask') or not hasattr(nu_subnet, 'gateway'):
+                            continue;
+                        if 'subnets' not in db:
+                            db['subnets'] = {};
+                        if _nu_subnet not in db['subnets']:
+                            db['subnets'][_nu_subnet] = {'name': _nu_subnet, 'number_of_containers': 0};
+                        db['subnets'][_nu_subnet]['enterprise'] = _nu_enterprise;
+                        db['subnets'][_nu_subnet]['domain'] = _nu_domain;
+                        db['subnets'][_nu_subnet]['zone'] = _nu_zone;
+                        db['subnets'][_nu_subnet]['alias'] = '-'.join(_nu_zone.replace("TEST", "nonprod").replace("GENERAL", "platform").lower().split('-'));
+                        db['subnets'][_nu_subnet]['network'] = "%s" % (IPv4Network("%s/%s" % (nu_subnet.address, nu_subnet.netmask)));
+                        db['subnets'][_nu_subnet]['gateway'] = "%s" % (nu_subnet.gateway);
+                        db['subnets'][_nu_subnet]['ip_stack'] = "%s" % (nu_subnet.ip_type);
+                        try:
+                            nu_subnet.vports.fetch();
+                        except:
+                            exc_type, exc_value, exc_traceback = sys.exc_info();
+                            logger.warn("%s: %s" % (exc_type, exc_value));
+                            continue;
+                        for nu_vport in sorted(nu_subnet.vports):
+                            if not nu_vport.has_attached_interfaces:
+                                continue;
+                            if not nu_vport.active:
+                                continue;
+                            if not hasattr(nu_vport, 'containers'):
+                                continue;
+                            try:
+                                nu_vport.containers.fetch();
+                            except:
+                                exc_type, exc_value, exc_traceback = sys.exc_info();
+                                logger.warn("%s: %s" % (exc_type, exc_value));
+                                continue;
+                            for nu_container in sorted(nu_vport.containers):
+                                _nu_container_uuid = "%s" % (nu_container.uuid);
+                                if 'containers' not in db:
+                                    db['containers'] = {};
+                                if _nu_container_uuid not in db['containers']:
+                                    db['containers'][_nu_container_uuid] = {'uuid': _nu_container_uuid};
+                                for f in fields['containers']:
+                                    if not hasattr(nu_container, f):
+                                        continue;
+                                    if getattr(nu_container, f, None) is None:
+                                        continue;
+                                    db['containers'][_nu_container_uuid][f] = getattr(nu_container, f);
+                                    if f == 'hypervisor_ip':
+                                        db['containers'][_nu_container_uuid][f] = str(getattr(nu_container, f)).split(',')[0];
+                                    if f == 'vrsid':
+                                        _vrsid = str(db['containers'][_nu_container_uuid][f])
+                                        if 'hosts' not in db['counters']:
+                                            db['counters']['hosts'] = {}
+                                        if _vrsid not in db['counters']['hosts']:
+                                            db['counters']['hosts'][_vrsid] = {'number_of_containers': 0}
+                                        db['counters']['hosts'][_vrsid]['number_of_containers'] += 1;
+                                for f in fields['vports']:
+                                    if not hasattr(nu_vport, f):
+                                        continue;
+                                    if getattr(nu_vport, f, None) is None:
+                                        continue;
+                                    db['containers'][_nu_container_uuid]['vport_' + f] = getattr(nu_vport, f);
+                                db['subnets'][_nu_subnet]['number_of_containers'] += 1;
+                                if not hasattr(nu_container, 'container_interfaces'):
+                                    continue;
+                                try:
+                                    nu_container.container_interfaces.fetch();
+                                except:
+                                    exc_type, exc_value, exc_traceback = sys.exc_info();
+                                    logger.warn("%s: %s" % (exc_type, exc_value));
+                                    continue;
+                                for nu_container_if in sorted(nu_container.container_interfaces):
+                                    #if 'interfaces' not in db['containers'][_nu_container_uuid]:
+                                    #    db['containers'][_nu_container_uuid]['interfaces'] = {};
+                                    nu_container_if_id = "%s" % (nu_container_if.name);
+                                    #if nu_container_if_id not in db['containers'][_nu_container_uuid]['interfaces']:
+                                    #    db['containers'][_nu_container_uuid]['interfaces'][nu_container_if_id] = {};
+                                    for f in fields['container_interfaces']:
+                                        if not hasattr(nu_container_if, f):
+                                            continue;
+                                        if getattr(nu_container_if, f, None) is None:
+                                            continue;
+                                        #db['containers'][_nu_container_uuid]['interfaces'][nu_container_if_id][f] = getattr(nu_container_if, f);
+                                        db['containers'][_nu_container_uuid]['interface_' + f] = getattr(nu_container_if, f);
+                                    break;
+
+        for nu_vsp in sorted(vsd_session.user.vsps):
+            _nu_vsp = "%s" % (nu_vsp.name);
+            _nu_vsp_version = "%s" % (nu_vsp.product_version);
+            _nu_vsp_location = "%s" % (nu_vsp.location);
+            _nu_vsp_description = "%s" % (nu_vsp.description);
+            logger.debug("VSP Name: %s, Version %s, Location: %s, Description: %s" % (_nu_vsp, _nu_vsp_version, _nu_vsp_location, _nu_vsp_description));
+            if not hasattr(nu_vsp, 'vscs'):
+                continue;
+            try:
+                nu_vsp.vscs.fetch();
+            except:
+                exc_type, exc_value, exc_traceback = sys.exc_info();
+                logger.warn("%s: %s" % (exc_type, exc_value));
+                continue;
+            for nu_vsc in sorted(nu_vsp.vscs):
+                _nu_vsc_id = "%s-%s" % (nu_vsc.name, nu_vsc.management_ip);
+                if 'controllers' not in db:
+                    db['controllers'] = {};
+                if _nu_vsc_id not in db:
+                    db['controllers'][_nu_vsc_id] = {'_id': _nu_vsc_id};
+                for f in fields['controllers']:
+                    if not hasattr(nu_vsc, f):
+                        continue;
+                    if getattr(nu_vsc, f, None) is None:
+                        continue;
+                    db['controllers'][_nu_vsc_id][f] = getattr(nu_vsc, f);
+                if args.sanity_check:
+                    for f in db['controllers'][_nu_vsc_id]:
+                        if f not in fields['controllers']:
+                            logger.error("The '%s' field is not in supported fields for controllers" % f);
+                            continue;
+                        t = _get_var_type(fields['controllers'][f]);
+                        if not isinstance(db['controllers'][_nu_vsc_id][f], t):
+                            logger.error("The '%s' field is defined as '%s', but actually is '%s' with value %s" % (f, fields['controllers'][f], type(db['controllers'][_nu_vsc_id][f]), db['controllers'][_nu_vsc_id][f]));
+
+                if not hasattr(nu_vsc, 'vrss'):
+                    continue;
+                try:
+                    nu_vsc.vrss.fetch();
+                except:
+                    exc_type, exc_value, exc_traceback = sys.exc_info();
+                    logger.warn("%s: %s" % (exc_type, exc_value));
+                    continue;
+                ''' Collect nuage_vsp_host_* metrics data '''
+                for nu_vrs in sorted(nu_vsc.vrss):
+                    _nu_vrs_vsc_active = False;
+                    _nu_vrs_id = "%s-%s" % (nu_vrs.hypervisor_name, nu_vrs.address);
+                    if not nu_vrs.hypervisor_name:
+                        continue;
+                    if 'hosts' not in db:
+                        db['hosts'] = {};
+                    if _nu_vrs_id not in db['hosts']:
+                        db['hosts'][_nu_vrs_id] = {'_id': _nu_vrs_id};
+                    if hasattr(nu_vrs, 'vsc_current_state'):
+                        if nu_vrs.vsc_current_state == 'PRIMARY':
+                            _nu_vrs_vsc_active = True;
+                            db['hosts'][_nu_vrs_id]['active_controller'] = str(nu_vsc.name);
+                        elif nu_vrs.vsc_current_state == 'SECONDARY':
+                            db['hosts'][_nu_vrs_id]['standby_controller'] = str(nu_vsc.name);
+                    if hasattr(nu_vrs, 'vsc_config_state'):
+                        if nu_vrs.vsc_config_state == 'PRIMARY':
+                            db['hosts'][_nu_vrs_id]['config_active_controller'] = str(nu_vsc.name);
+                        elif nu_vrs.vsc_current_state == 'SECONDARY':
+                            db['hosts'][_nu_vrs_id]['config_standby_controller'] = str(nu_vsc.name);
+                    for f in fields['hosts']:
+                        if not hasattr(nu_vrs, f):
+                            continue;
+                        if getattr(nu_vrs, f, None) is None:
+                            continue;
+                        if f in db['hosts'][_nu_vrs_id] and _nu_vrs_vsc_active != True:
+                            continue;
+                        db['hosts'][_nu_vrs_id][f] = getattr(nu_vrs, f);
+                        if f == 'uptime':
+                            try:
+                                db['hosts'][_nu_vrs_id]['uptime_epoch'] = int(timestamp - round(int(nu_vrs.uptime)/1000));
+                                db['hosts'][_nu_vrs_id]['uptime_date'] = time.strftime('%Y-%m-%d', time.localtime(db['hosts'][_nu_vrs_id]['uptime_epoch']));
+                            except:
+                                pass;
+                    if args.sanity_check:
+                        for f in db['hosts'][_nu_vrs_id]:
+                            if f not in fields['hosts']:
+                                logger.error("The '%s' field is not in supported fields for hosts" % f);
+                                continue;
+                            t = _get_var_type(fields['hosts'][f]);
+                            if not isinstance(db['hosts'][_nu_vrs_id][f], t):
+                                logger.error("The '%s' field is defined as '%s', but actually is '%s' with value %s" % (f, fields['hosts'][f], type(db['hosts'][_nu_vrs_id][f]), db['hosts'][_nu_vrs_id][f]));
+
+        if 'hosts' in db:
+            for _nu_vrs_id in db['hosts']:
+                for i in ['active', 'standby']:
+                    m = 'nuage_vsp_host_%s_controller_set' % i;
+                    if 'entries' not in metrics[m]:
+                        metrics[m]['entries'] = [];
+                    _id = 'uuid';
+                    _uuid = _nu_vrs_id;
+                    if '_id' in db['hosts'][_nu_vrs_id]:
+                        _uuid = db['hosts'][_nu_vrs_id]['_id'];
+                    labels = [];
+                    labels.append("%s=\"%s\"" % (_id, _uuid));
+                    if i + '_controller' in db['hosts'][_nu_vrs_id]:
+                        ctrl_name = db['hosts'][_nu_vrs_id][i + '_controller']
+                        if 'controllers' not in db['counters']:
+                            db['counters']['controllers'] = {}
+                        if ctrl_name not in db['counters']['controllers']:
+                            db['counters']['controllers'][ctrl_name] = {'number_of_hosts': 0}
+                        db['counters']['controllers'][ctrl_name]['number_of_hosts'] += 1
+                        metrics[m]['entries'].append('{%s} %d' % (','.join(labels), 1));
+                    else:
+                        metrics[m]['entries'].append('{%s} %d' % (','.join(labels), 0));
+
+        for i in ['hosts', 'controllers', 'containers', 'subnets']:
+            if i not in db:
+                continue;
+            for j in sorted(db[i]):
+                entry = db[i][j];
+                _id = 'uuid';
+                metric_prefix = 'nuage_vsp_%s_' % i.rstrip('s');
+                if i == 'controllers' and 'name' in entry:
+                    try:
+                        if entry['name'] in db['counters']['controllers']:
+                            entry['number_of_hosts'] = db['counters']['controllers'][entry['name']]['number_of_hosts']
+                    except:
+                        pass
+                elif i == 'hosts' and 'number_of_containers' in entry:
+                    try:
+                        if entry['number_of_containers'] == 0 and 'hypervisor_identifier' in db[i][j]:
+                            if db[i][j]['_id'] in db['counters']['hosts']:
+                                entry['number_of_containers'] = db['counters']['hosts'][db[i][j]['_id']]['number_of_containers']
+                    except:
+                        pass
+                else:
+                    pass
+                _uuid = j
+                if '_id' in entry:
+                   _uuid = entry['_id'];
+                for k in entry:
+                    if k in ['uuid', '_id']:
+                        continue;
+                    if isinstance(entry[k], (str, unicode)):
+                        m = metric_prefix + k
+                        if m not in metrics:
+                            metrics[m] = {'help': 'Nuage VSP %s %s' % (i.rstrip('s'), k), 'type': 'gauge', 'entries': []}
+                        if 'entries' not in metrics[m]:
+                            metrics[m]['entries'] = [];
+                        labels = [];
+                        labels.append("%s=\"%s\"" % (_id, _uuid));
+                        if k == 'status':
+                            if metric_prefix + 'up' not in metrics:
+                                metrics[metric_prefix + 'up'] = {'help': 'Nuage VSP %s up (1) or not (0)' % (i.rstrip('s')), 'type': 'gauge', 'entries': []}
+                            if entry[k] in ['up', 'UP', 'RUNNING']:
+                                metrics[metric_prefix + 'up']['entries'].append('{%s} %d' % (','.join(labels), 1));
+                            else:
+                                metrics[metric_prefix + 'up']['entries'].append('{%s} %d' % (','.join(labels), 0));
+                        labels.append("%s=\"%s\"" % (k, entry[k]));
+                        value = 1
+                        metrics[m]['entries'].append('{%s} %d' % (','.join(labels), value));
+                        checksum = sum([ord(x) + 128 for x in str(','.join(labels))]);
+                        labels = [];
+                        labels.append("%s=\"%s\"" % (_id, _uuid));
+                        labels.append("metric=\"%s\"" % (m));
+                        metrics['nuage_vsp_metric_changed']['entries'].append('{%s} %d' % (','.join(labels), checksum));
+                    elif isinstance(entry[k], (int, float)):
+                        m = metric_prefix + k.replace('cpuusage', 'cpu_usage');
+                        if m not in metrics:
+                            logger.error("The '%s' metric is unsupported because not in metrics map" % (m));
+                            continue;
+                        if 'skip' in metrics[m]:
+                            continue;
+                        if 'entries' not in metrics[m]:
+                            metrics[m]['entries'] = [];
+                        labels = [];
+                        labels.append("%s=\"%s\"" % (_id, _uuid));
+                        if isinstance(entry[k], (int)):
+                            metrics[m]['entries'].append('{%s} %d' % (','.join(labels), entry[k]));
+                        else:
+                            metrics[m]['entries'].append('{%s} %.2f' % (','.join(labels), entry[k]));
+                    else:
+                        logger.error("The '%s' field in %s has unsupported type: %s" % (k, i, type(entry[k])));
+
+        timestamp = None;
+        if args.add_timestamp:
+            timestamp = str(int(round(time.time() * 1000)));
+        with open(os.path.join(args.output), 'w') as f:
+            for m in sorted(metrics):
+                if len(metrics[m]) == 0:
+                    continue;
+                if 'entries' not in metrics[m]:
+                    continue;
+                f.write('# HELP ' + m + ' ' + metrics[m]['help'] + '\n');
+                f.write('# TYPE ' + m + ' ' + metrics[m]['type'] + '\n');
+                for entry in metrics[m]['entries']:
+                    f.write('%s%s\n' % (m, entry));
+            logger.debug("Wrote metrics to %s" % (args.output));
+
+    except:
+        exc_type, exc_value, exc_traceback = sys.exc_info();
+        logger.error("%s: %s" % (exc_type, exc_value));
+        logger.error("%s" % (traceback.print_tb(exc_traceback)));
+        sys.exit(1);
+
+if __name__ == '__main__':
+    main();
